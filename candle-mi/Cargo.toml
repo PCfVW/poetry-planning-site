@@ -1,0 +1,200 @@
+[package]
+name = "candle-mi"
+version = "0.1.18"
+edition = "2024"
+description = "Mechanistic interpretability for language models in Rust, built on candle"
+license = "MIT OR Apache-2.0"
+keywords = ["interpretability", "transformers", "mechanistic", "candle", "rust"]
+categories = ["science"]
+rust-version = "1.88"
+# Keep the published package lean (the library is just `src/`). Excludes repo
+# content crate consumers never need: docs + experiment data, validation
+# scripts/oracle reference JSONs, screenshots/gifs, design notes, test fixtures,
+# and example output data. All `[[example]]`/`[[test]]` `.rs` sources are kept;
+# nothing here is referenced at compile time (verified: no `include_*!`).
+exclude = [
+    "docs/",
+    "data/",
+    "design/",
+    "scripts/",
+    "examples/results/",
+    "examples/screenshots/",
+    "examples/figure13/",
+    "tests/fixtures/",
+]
+
+[dependencies]
+# Candle ML framework (pinned to 0.11.x per design/candle-version.md)
+candle-core = "0.11"
+candle-nn = "0.11"
+
+# HuggingFace integration.
+# Pinned to `0.22` to match candle-core 0.11's own `tokenizers` dependency — a
+# single resolved `tokenizers` version (no dev-tree duplicate). `default-features
+# = false` drops the `progressbar` feature (tokenizers' training progress bars,
+# which candle-mi never uses — its download bars are hf-fetch-model's indicatif
+# 0.18); `onig` (Oniguruma regex — tokenization parity) and `esaxx_fast` are the
+# other two default features, kept unchanged. The dev tree stays on a single
+# active `windows-sys` (0.61.2) — see the v0.1.18 windows-sys dedup.
+tokenizers = { version = "0.22", default-features = false, features = ["onig", "esaxx_fast"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+safetensors = "0.4"
+
+# Error handling (typed MIError per design/error-handling.md)
+thiserror = "2"
+anyhow = "1.0"
+
+# Random number generation
+rand = "0.8"
+
+# Statistics
+statrs = "0.17"
+
+# Logging
+tracing = "0.1"
+
+# Model downloads (hf-fetch-model wraps hf-hub v0.5)
+hf-fetch-model = { version = "0.10.7", features = ["indicatif"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+# Optional: process RAM + GPU VRAM measurement, delegated to the standalone
+# `hypomnesis` crate (DXGI/NVML/nvidia-smi/Metal). Lean feature set — candle-mi
+# only measures its own process and device totals, so `pdh` (foreign-process
+# listing) is omitted; `metal` keeps macOS support.
+hypomnesis = { version = "0.2.4", optional = true, default-features = false, features = [
+    "nvml",
+    "dxgi",
+    "nvidia-smi-fallback",
+    "metal",
+] }
+
+# Optional: tensor format parsing via anamnesis
+# - sae feature activates "npz" (Gemma Scope SAE weights)
+# - stoicheia feature activates "pth" (AlgZoo .pth agnostic loading)
+# - quantized feature activates "bnb"/"awq"/"gptq" (dequant-to-BF16 weight loading)
+anamnesis = { version = "0.6.8", optional = true }
+
+# Windows-only deps. The `probing` feature's linear-probe stack is developed and
+# exercised on Windows, so its crates are gated to `cfg(windows)`.
+[target.'cfg(windows)'.dependencies]
+# Optional: probing
+ndarray = { version = "0.15", optional = true }
+linfa = { version = "0.7", optional = true }
+linfa-logistic = { version = "0.7", optional = true }
+
+[dev-dependencies]
+clap = { version = "4", features = ["derive"] }
+serial_test = "3.4.0"
+tempfile = "3.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tracing-subscriber = "0.3"
+
+# Integration tests — each gated behind its feature so `cargo test --features X`
+# only compiles the tests that use feature X.
+[[example]]
+name = "figure13_planning_poems"
+required-features = ["clt", "transformer"]
+
+[[example]]
+name = "figure13_newline_census"
+required-features = ["clt", "transformer"]
+
+[[example]]
+name = "figure13_newline_steering"
+required-features = ["clt", "transformer"]
+
+[[example]]
+name = "maar_contrastive_steering"
+required-features = ["transformer"]
+
+[[example]]
+name = "vocab_scan"
+required-features = ["clt", "transformer"]
+
+[[example]]
+name = "clt_vs_plt_planning_site"
+required-features = ["clt", "transformer"]
+
+[features]
+default = ["cuda", "transformer"]
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+metal = ["candle-core/metal", "candle-nn/metal"]
+transformer = []
+mmap = []
+rwkv = []
+rwkv-tokenizer = []
+# Diffusion-LM backend (MDLM masked-diffusion DiT). Standalone — does not
+# require `transformer`. See `src/diffusion/`.
+diffusion = []
+clt = []
+sae = ["dep:anamnesis", "anamnesis/npz"]
+stoicheia = ["dep:anamnesis", "anamnesis/pth"]
+# Load quantized checkpoints (bitsandbytes NF4/FP4/INT8, AWQ, GPTQ) by
+# dequantizing to BF16 in memory via anamnesis, then loading the standard
+# safetensors bytes through candle's VarBuilder. See `backend::from_pretrained`.
+quantized = ["dep:anamnesis", "anamnesis/bnb", "anamnesis/awq", "anamnesis/gptq"]
+memory = ["dep:hypomnesis"]
+memory-debug = ["memory", "hypomnesis/debug-output"]
+probing = ["linfa", "linfa-logistic", "ndarray"]
+
+[lints.rust]
+# unsafe_code is controlled via cfg_attr in lib.rs (forbid by default, deny with mmap/memory)
+elided_lifetimes_in_paths = "deny"     # Rule 1
+missing_docs              = "warn"     # Rule 12 prerequisite
+
+[lints.clippy]
+# Rule 3: No panics or indexing in library code
+unwrap_used               = "deny"
+expect_used               = "deny"
+panic                     = "deny"
+indexing_slicing           = "deny"
+
+# Rule 7: Exhaustive matching
+wildcard_enum_match_arm             = "deny"
+match_wildcard_for_single_variants  = "deny"
+
+# Rule 11: #[non_exhaustive] policy (forces a decision on every public enum)
+exhaustive_enums          = "warn"
+
+# Rule 2: Explicit conversions (warn only — numeric casts need annotation, not prohibition)
+as_conversions            = "warn"
+cast_possible_truncation  = "warn"
+cast_precision_loss       = "warn"
+cast_sign_loss            = "warn"
+
+# Rule 9: Prefer iterators (warn only — recurrent algorithms need explicit exemption)
+explicit_iter_loop        = "warn"
+manual_filter_map         = "warn"
+manual_find_map           = "warn"
+needless_range_loop       = "warn"
+
+# Documentation
+missing_docs_in_private_items = "warn"
+missing_errors_doc        = "warn"
+missing_panics_doc        = "warn"
+
+# General pedantic + nursery quality baseline
+pedantic  = { level = "warn", priority = -1 }
+nursery   = { level = "warn", priority = -1 }
+
+# Suppressed lints that are too noisy for this domain
+module_name_repetitions   = "allow"
+too_many_lines            = "allow"
+must_use_candidate        = "warn"      # Rule 17
+
+# docs.rs builds in a sandbox without CUDA toolkit — disable cuda, enable all
+# CPU-safe features so the generated docs cover the full public API surface.
+[package.metadata.docs.rs]
+no-default-features = true
+features = ["transformer", "rwkv", "rwkv-tokenizer", "diffusion", "clt", "sae", "quantized", "mmap", "memory", "probing", "stoicheia"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+
+[profile.dev]
+opt-level = 1

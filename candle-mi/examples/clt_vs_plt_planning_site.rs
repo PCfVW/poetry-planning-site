@@ -1,0 +1,1757 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! CLT vs PLT planning-site comparison on Llama 3.2 1B — shared harness.
+//!
+//! Two modes, selected via `--schema`:
+//!
+//! - `--schema clt` — **Step A** (reference replication). Loads
+//!   `mntss/clt-llama-3.2-1b-524k`, runs the `-ee` rhyming-couplet
+//!   `figure13_planning_poems.rs` protocol verbatim (suppress `-ee` group
+//!   features + inject `"that"` at strength 10.0, 31-position sweep). Writes
+//!   `data/clt-vs-plt-planning-site/clt_step_a_llama.json`. Locks
+//!   the paper result in the same harness that Step B reuses.
+//!
+//! - `--schema both` (default) — **Step B** (method-matched comparison).
+//!   Runs BOTH the `CLT` and `PLT` transcoders side-by-side with two causal
+//!   protocols each: (1) *suppress-only* zeroes out the top-5 features that
+//!   point at `unembed("that")` at each sweep position (V3 Step 1.7 clean
+//!   formulation); (2) *suppress+inject* mirrors Step A's protocol but with
+//!   decoder-projection-derived features — suppress top-5 + inject the
+//!   top-1 feature at strength 10.0.
+//!   Four position sweeps total (2 arms × 2 protocols). Collects the full V3
+//!   Step 1.7 instrumentation payload: top-20 decoder-projection rankings,
+//!   top-20 decoder vectors, all-layer × all-position activation traces for
+//!   each top-20 feature, 32-bin pre-activation histograms at the spike
+//!   layer and its two neighbours, the PLT `W_skip · x` projection at the
+//!   spike position (PLT-only), and both CLT decoder-slice metrics
+//!   (same-layer and max-over-target-layers) in parallel. Writes
+//!   `data/clt-vs-plt-planning-site/clt_vs_plt_llama.json`.
+//!
+//! Device: CUDA-or-bust. Hard-fails if the device selector falls back to
+//! CPU (keeps the `CLT`/`PLT` comparison on the same device family).
+//!
+//! Reference value: `P("that") = 0.687` on candle 0.9 with this CLT
+//! (matches `figure13_planning_poems.rs` on the same build). The
+//! predecessor implementation and the companion study report `0.777` — the gap is
+//! runtime-stack drift, not a bug.
+//!
+//! Run:
+//! ```bash
+//! # Step B full comparison (default, ~3 min on CUDA):
+//! cargo run --release --features clt,transformer,mmap --example clt_vs_plt_planning_site
+//!
+//! # Step A only (paper replication, ~25 s):
+//! cargo run --release --features clt,transformer,mmap \
+//!   --example clt_vs_plt_planning_site -- --schema clt
+//! ```
+//!
+//! Plan: [`docs/roadmaps/PLAN-PLT-LLAMA-PLANNING-SIGNAL.md`] Step B;
+//! instrumentation spec: V3 Step 1.7.
+
+#![allow(clippy::doc_markdown)]
+#![allow(clippy::cast_precision_loss)]
+#![allow(clippy::missing_docs_in_private_items)]
+
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use candle_core::{DType, IndexOp, Tensor};
+use clap::Parser;
+use serde::Serialize;
+
+use candle_mi::clt::{CltFeatureId, CrossLayerTranscoder};
+use candle_mi::{HookPoint, HookSpec, MIModel, extract_token_prob};
+
+// ── Constants ───────────────────────────────────────────────────────────────
+
+const DEFAULT_STRENGTH: f32 = 10.0;
+const DEFAULT_TOP_K: usize = 5;
+/// Step B tracks the top-20 features per arm (a superset of the top-5 used
+/// for suppression). V3 Step 1.7 (E) uses the top-20 for qualitative /
+/// cross-layer-binding inspection without re-running forward passes.
+const STEP_B_TOP_N: usize = 20;
+/// Spike-layer neighbours to histogram. V3 Step 1.7 (D) spec — the spike
+/// layer is discovered per run; the offsets pick the spike's two neighbours.
+const HISTOGRAM_NEIGHBOUR_OFFSETS: &[i64] = &[-1, 0, 1];
+/// 32-bin fixed-edge histogram is the V3 Step 1.7 (D) spec.
+const HISTOGRAM_N_BINS: usize = 32;
+
+// ── Family presets ──────────────────────────────────────────────────────────
+
+/// Which `HookPoint` the family's `PLT` encoder reads its input from.
+///
+/// `PltBundle` (Llama `mntss/transcoder-*`) reads from the residual stream
+/// between attention and MLP (`hook_resid_mid` in `TransformerLens`-speak,
+/// [`HookPoint::ResidMid`] here). `GemmaScopeNpz`'s `config.yaml` declares
+/// `feature_input_hook: "ln2.hook_normalized"` — the post-`LN2` (pre-MLP)
+/// normalised residual, captured in candle-mi as [`HookPoint::MlpPre`]
+/// (verified at `src/transformer/mod.rs` immediately after
+/// `layer.mid_norm.forward(...)`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PltInputHook {
+    /// `blocks.{i}.hook_resid_mid` — Llama `PltBundle`.
+    ResidMid,
+    /// `blocks.{i}.mlp.hook_pre` — `GemmaScope` (post-`LN2`).
+    MlpPre,
+}
+
+impl PltInputHook {
+    /// Resolve to the concrete [`HookPoint`] for a given layer index.
+    const fn at(self, layer: usize) -> HookPoint {
+        match self {
+            Self::ResidMid => HookPoint::ResidMid(layer),
+            Self::MlpPre => HookPoint::MlpPre(layer),
+        }
+    }
+}
+
+/// Per-family configuration for the planning-site harness.
+///
+/// Centralises every model-, transcoder-, and prompt-specific constant so
+/// `run_step_a` and `run_step_b` are family-agnostic. Two shipped presets:
+/// [`LLAMA`] (the original replication target) and [`GEMMA`].
+struct FamilyPreset {
+    /// Display name used in CLI matching and output filenames.
+    name: &'static str,
+    /// Default `HuggingFace` model id.
+    model: &'static str,
+    /// Default `HuggingFace` `CLT` repository.
+    clt_repo: &'static str,
+    /// Default `HuggingFace` `PLT` repository (or `GemmaScope` curation repo).
+    plt_repo: &'static str,
+    /// Rhyming-couplet prompt that primes a planning site at the trailing
+    /// position.
+    prompt: &'static str,
+    /// The word being suppressed (`-ee` for Llama, `-out` for Gemma).
+    suppress_word: &'static str,
+    /// The word being injected (the planning target).
+    inject_word: &'static str,
+    /// Hand-picked suppress features for Step A (paper replication).
+    suppress_features: &'static [(usize, usize)],
+    /// Hand-picked inject feature for Step A (paper replication).
+    inject_feature: (usize, usize),
+    /// Reference `P(inject_word)` at the spike on this candle 0.9 build,
+    /// pinned by running `examples/figure13_planning_poems.rs --preset` on
+    /// the same model + CLT first.
+    reference_max_prob: f32,
+    /// Tolerance (±absolute) on the reference value before Step A's
+    /// sanity-gate emits a `WARN` (still proceeds).
+    reference_tol: f32,
+    /// Hard-fail threshold: a spike below this indicates the harness is
+    /// broken, not noise. Pinned at ~0.73 × `reference_max_prob` (Llama's
+    /// 0.50/0.687 ratio).
+    spike_hard_min: f32,
+    /// `HookPoint` family the `PLT` encoder reads from. See [`PltInputHook`].
+    plt_input_hook: PltInputHook,
+    /// Whether this family's `PLT` ships a `W_skip` linear path that we
+    /// project at the spike position. `true` for Llama `PltBundle`,
+    /// `false` for `GemmaScope` (pure `JumpReLU` transcoder, no skip path).
+    plt_has_w_skip: bool,
+    /// Output filename for Step A (in the experiment dir).
+    step_a_output: &'static str,
+    /// Output filename for Step B (in the experiment dir).
+    step_b_output: &'static str,
+}
+
+/// Llama 3.2 1B + `mntss/clt-llama-3.2-1b-524k` + `mntss/transcoder-Llama-3.2-1B`.
+///
+/// The original replication target. Reference `P("that") = 0.687` at
+/// the spike position on the candle 0.9 stack; cf. the predecessor implementation's reported 0.777
+/// (cause of the gap not investigated — KV-cache differences, candle-core
+/// version delta, or both are plausible candidates).
+///
+/// Suppress `-ee` group: `L13:30985 ("he")`, `L9:5488 ("be")`,
+/// `L14:27874 ("ne")`, `L13:32049 ("we")`. Inject `"that" (L14:13043)`.
+const LLAMA: FamilyPreset = FamilyPreset {
+    name: "llama",
+    model: "meta-llama/Llama-3.2-1B",
+    clt_repo: "mntss/clt-llama-3.2-1b-524k",
+    plt_repo: "mntss/transcoder-Llama-3.2-1B",
+    prompt: "The birds were singing in the tree,\n\
+             And everything was wild and free.\n\
+             The river ran down to the sea,\n\
+             There is so much we cannot",
+    suppress_word: "free",
+    inject_word: "that",
+    suppress_features: &[(13, 30985), (9, 5488), (14, 27874), (13, 32049)],
+    inject_feature: (14, 13043),
+    reference_max_prob: 0.687,
+    reference_tol: 1e-2,
+    spike_hard_min: 0.50,
+    plt_input_hook: PltInputHook::ResidMid,
+    plt_has_w_skip: true,
+    step_a_output: "clt_step_a_llama.json",
+    step_b_output: "clt_vs_plt_llama.json",
+};
+
+/// Gemma 2 2B + `mntss/clt-gemma-2-2b-426k` + `mntss/gemma-scope-transcoders`.
+///
+/// Reference `P(" around") = 0.457` at the spike position (trailing space
+/// after "passage") on the candle 0.9 stack — measured 2026-05-01 via
+/// `examples/figure13_planning_poems.rs --preset gemma2-2b-426k` (cf.
+//reference's reported 0.483; ~5% drift, smaller than Llama's ~12%).
+///
+/// Suppress `-out` group: `L16:13725 ("about")`, `L25:9385 ("out")`.
+/// Inject `"around" (L22:10243)`. The PLT side uses `GemmaScope` (loaded
+/// via the v0.1.10 `TranscoderSchema::GemmaScopeNpz` two-repo flow); its
+/// encoder reads from `MlpPre` (post-`LN2`) and it has no `W_skip`.
+const GEMMA: FamilyPreset = FamilyPreset {
+    name: "gemma",
+    model: "google/gemma-2-2b",
+    clt_repo: "mntss/clt-gemma-2-2b-426k",
+    plt_repo: "mntss/gemma-scope-transcoders",
+    prompt: "The stars were twinkling in the night,\n\
+             The lanterns cast a golden light.\n\
+             She wandered in the dark about,\n\
+             And found a hidden passage",
+    suppress_word: "out",
+    inject_word: "around",
+    suppress_features: &[(16, 13725), (25, 9385)],
+    inject_feature: (22, 10243),
+    reference_max_prob: 0.457,
+    reference_tol: 1e-2,
+    spike_hard_min: 0.30,
+    plt_input_hook: PltInputHook::MlpPre,
+    plt_has_w_skip: false,
+    step_a_output: "clt_step_a_gemma2_2b.json",
+    step_b_output: "clt_vs_plt_gemma2_2b.json",
+};
+
+/// Resolve a `--family` CLI value to the matching [`FamilyPreset`].
+fn resolve_family(name: &str) -> candle_mi::Result<&'static FamilyPreset> {
+    match name {
+        "llama" => Ok(&LLAMA),
+        "gemma" => Ok(&GEMMA),
+        other => Err(candle_mi::MIError::Config(format!(
+            "--family must be `llama` or `gemma`, got `{other}`"
+        ))),
+    }
+}
+
+// ── CLI ─────────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+#[command(name = "clt_vs_plt_planning_site")]
+#[command(about = "CLT vs PLT planning-site comparison")]
+struct Args {
+    /// Model family. `llama` (default — Llama 3.2 1B + Llama PLT, original
+    /// reference replication target); `gemma` (Gemma 2 2B + GemmaScope PLT,
+    /// shipped in v0.1.10).
+    #[arg(long, default_value = "llama")]
+    family: String,
+
+    /// Mode. `both` (default) runs Step B (full comparison, both arms,
+    /// both protocols); `clt` runs Step A (reference replication, CLT only).
+    #[arg(long, default_value = "both")]
+    schema: String,
+
+    /// `HuggingFace` model ID. If omitted, uses the family's default
+    /// (`meta-llama/Llama-3.2-1B` for `llama`, `google/gemma-2-2b` for
+    /// `gemma`).
+    #[arg(long)]
+    model: Option<String>,
+
+    /// `HuggingFace` `CLT` repository. If omitted, uses the family's default.
+    #[arg(long)]
+    clt_repo: Option<String>,
+
+    /// `HuggingFace` `PLT` repository (used by Step B). If omitted, uses
+    /// the family's default. For `gemma`, the user-facing arg is the
+    /// curation repo (`mntss/gemma-scope-transcoders`); the actual NPZ
+    /// weights are fetched from `google/gemma-scope-2b-pt-transcoders` by
+    /// `CrossLayerTranscoder::open` automatically.
+    #[arg(long)]
+    plt_repo: Option<String>,
+
+    /// Steering strength for both the suppress and inject hooks.
+    #[arg(long, default_value_t = DEFAULT_STRENGTH)]
+    strength: f32,
+
+    /// Number of top decoder-projection features used for Step A's auxiliary
+    /// ranking. Step B ignores this flag and always records top-20 features
+    /// (`STEP_B_TOP_N`).
+    #[arg(long, default_value_t = DEFAULT_TOP_K)]
+    top_k: usize,
+
+    /// Output JSON path override. Defaults per mode + family:
+    /// `--schema clt` → `clt_step_a_{family}.json`;
+    /// `--schema both` → `clt_vs_plt_{family}.json`.
+    #[arg(long)]
+    output: Option<PathBuf>,
+}
+
+impl Args {
+    /// Resolve every effective string field against the family preset
+    /// (CLI value if provided, preset default otherwise).
+    fn model<'a>(&'a self, preset: &'static FamilyPreset) -> &'a str {
+        // BORROW: explicit .as_deref() — &str view of Option<String> with preset fallback
+        self.model.as_deref().unwrap_or(preset.model)
+    }
+    fn clt_repo<'a>(&'a self, preset: &'static FamilyPreset) -> &'a str {
+        self.clt_repo.as_deref().unwrap_or(preset.clt_repo)
+    }
+    fn plt_repo<'a>(&'a self, preset: &'static FamilyPreset) -> &'a str {
+        self.plt_repo.as_deref().unwrap_or(preset.plt_repo)
+    }
+}
+
+// ── Step A output types ─────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct StepAOutput {
+    schema: String,
+    model: String,
+    transcoder_repo: String,
+    prompt: String,
+    tokens: Vec<String>,
+    suppress_word: String,
+    inject_word: String,
+    inject_token_id: u32,
+    suppress_features: Vec<CltFeatureId>,
+    inject_feature: CltFeatureId,
+    strength: f32,
+    top_k_target_layer: usize,
+    top_k_features: Vec<FeatureScore>,
+    baseline_prob: f32,
+    baseline_logit: f32,
+    spike_position: usize,
+    spike_token: String,
+    max_prob: f32,
+    max_logit: f32,
+    delta_prob: f32,
+    delta_logit: f32,
+    reference_max_prob: f32,
+    reference_tolerance: f32,
+    sweep: Vec<PositionResult>,
+}
+
+// ── Step B output types ─────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct StepBOutput {
+    experiment: &'static str,
+    step: &'static str,
+    runtime_seconds: f64,
+    device_name: String,
+    model: String,
+    prompt: String,
+    tokens: Vec<String>,
+    inject_word: String,
+    inject_token_id: u32,
+    top_k_target_layer: usize,
+    baseline_prob: f32,
+    baseline_logit: f32,
+    arms: ArmOutputs,
+    sanity_gates: SanityGates,
+}
+
+#[derive(Serialize)]
+struct ArmOutputs {
+    clt: ArmOutput,
+    plt: ArmOutput,
+}
+
+#[derive(Serialize)]
+struct ArmOutput {
+    schema: String,
+    transcoder_repo: String,
+    n_layers: usize,
+    n_features_per_layer: usize,
+    top_20_features_same_layer: Vec<FeatureScore>,
+    top_20_features_max_over_target: Option<Vec<FeatureScore>>,
+    top_20_decoder_vectors_same_layer: Vec<Vec<f32>>,
+    pre_activation_histograms: HashMap<String, Histogram>,
+    all_layer_activation_trace: ActivationTrace,
+    w_skip_projection_at_spike: Option<f32>,
+    suppress_only: CausalTestResult,
+    suppress_inject: CausalTestResult,
+    /// Follow-up 1 (CLT only): re-run the CLT arm's suppression with the
+    /// top-5 from the max-over-target-layers ranking instead of same-layer,
+    /// to test whether the arm asymmetry on Llama 3.2 1B is a ranking-method
+    /// artefact rather than a transcoder-class limitation (see
+    /// [`findings.md`]). `None` for PLT (no max-over-target metric exists by
+    /// construction).
+    ///
+    /// [`findings.md`]: ../data/clt-vs-plt-planning-site/findings.md
+    max_over_target_follow_up: Option<MaxOverTargetFollowUp>,
+}
+
+#[derive(Serialize)]
+// All three fields describe suppression protocols — the shared prefix is
+// intentional and mirrors the `suppress_only`/`suppress_inject` naming of
+// the primary arm.
+#[allow(clippy::struct_field_names)]
+struct MaxOverTargetFollowUp {
+    /// Suppress only — top-5 from max-over-target ranking, no inject.
+    suppress_only: CausalTestResult,
+    /// Suppress + inject where inject is **also** drawn from the
+    /// max-over-target ranking (top-1). Fully method-matched variant.
+    suppress_inject_ranked_inject: CausalTestResult,
+    /// Suppress + inject where inject is held **constant** at the same-layer
+    /// top-1 (same as the primary suppress+inject arm). Isolates the effect
+    /// of swapping the suppress set alone, inject varying removed.
+    suppress_inject_same_inject: CausalTestResult,
+}
+
+#[derive(Serialize)]
+struct CausalTestResult {
+    protocol: String,
+    suppress_features: Vec<CltFeatureId>,
+    inject_feature: Option<CltFeatureId>,
+    strength: f32,
+    spike_position: usize,
+    spike_token: String,
+    max_prob: f32,
+    max_logit: f32,
+    delta_prob: f32,
+    delta_logit: f32,
+    sweep: Vec<PositionResult>,
+}
+
+#[derive(Serialize)]
+struct Histogram {
+    bin_edges: Vec<f32>,
+    counts: Vec<u64>,
+}
+
+#[derive(Serialize)]
+struct ActivationTrace {
+    feature_ids: Vec<CltFeatureId>,
+    layer_indices: Vec<usize>,
+    positions: Vec<usize>,
+    /// Shape `[n_features][n_layers][seq_len]` — dense post-ReLU
+    /// activations retrieved from `encode()`'s sparse output (absent
+    /// features default to `0.0`).
+    values: Vec<Vec<Vec<f32>>>,
+}
+
+#[derive(Serialize)]
+struct SanityGates {
+    clt_reference_max_prob: f32,
+    clt_reference_tolerance: f32,
+    clt_hard_min: f32,
+    clt_suppress_inject_gate_triggered: bool,
+    plt_reference_max_prob: Option<f32>,
+}
+
+// ── Shared output types ─────────────────────────────────────────────────────
+
+#[derive(Serialize, Clone)]
+struct FeatureScore {
+    feature: CltFeatureId,
+    cosine: f32,
+}
+
+#[derive(Serialize, Clone)]
+struct PositionResult {
+    position: usize,
+    token: String,
+    prob: f32,
+    logit: f32,
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+const fn feature_id(pair: (usize, usize)) -> CltFeatureId {
+    CltFeatureId {
+        layer: pair.0,
+        index: pair.1,
+    }
+}
+
+fn default_output_path(step: Step, preset: &'static FamilyPreset) -> PathBuf {
+    let filename = match step {
+        Step::A => preset.step_a_output,
+        Step::B => preset.step_b_output,
+    };
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("docs")
+        .join("experiments")
+        .join("clt-vs-plt-planning-site")
+        .join(filename)
+}
+
+#[derive(Copy, Clone)]
+enum Step {
+    A,
+    B,
+}
+
+/// Extract the raw logit at `token_id` from the last sequence position.
+fn extract_token_logit(logits: &Tensor, token_id: u32) -> candle_mi::Result<f32> {
+    // PROMOTE: logits may arrive in BF16/F16; F32 for scalar extraction.
+    let logits_f32 = logits.to_dtype(DType::F32)?;
+    let last_logits = match logits_f32.dims().len() {
+        1 => logits_f32,
+        2 => {
+            let seq_len = logits_f32.dim(0)?;
+            logits_f32.i(seq_len - 1)?
+        }
+        3 => {
+            let seq_len = logits_f32.dim(1)?;
+            logits_f32.i((0, seq_len - 1))?
+        }
+        n => {
+            return Err(candle_mi::MIError::Config(format!(
+                "extract_token_logit: expected 1-3 dims, got {n}"
+            )));
+        }
+    };
+    // CAST: u32 → usize, token ID used as 1-D tensor index
+    #[allow(clippy::as_conversions)]
+    let logit = last_logits.i(token_id as usize)?.to_scalar::<f32>()?;
+    Ok(logit)
+}
+
+/// Fixed-edge histogram over `values`. Returns `HISTOGRAM_N_BINS + 1` bin
+/// edges (min → max, inclusive) and `HISTOGRAM_N_BINS` counts. Values outside
+/// `[min, max]` are clipped to the edge bins; NaN is dropped.
+fn fixed_edge_histogram(values: &[f32], min: f32, max: f32) -> Histogram {
+    // CAST: usize → f32 for bin-width arithmetic (HISTOGRAM_N_BINS = 32, exact)
+    #[allow(clippy::as_conversions)]
+    let n_bins_f = HISTOGRAM_N_BINS as f32;
+    let width = (max - min) / n_bins_f;
+    let mut bin_edges: Vec<f32> = Vec::with_capacity(HISTOGRAM_N_BINS + 1);
+    for i in 0..=HISTOGRAM_N_BINS {
+        // CAST: usize → f32, `i <= 32`, exact
+        #[allow(clippy::as_conversions)]
+        let i_f = i as f32;
+        // Fused multiply-add: min + width * i_f, as clippy::suboptimal_flops suggests.
+        bin_edges.push(width.mul_add(i_f, min));
+    }
+    let mut counts: Vec<u64> = vec![0; HISTOGRAM_N_BINS];
+    for &v in values {
+        if v.is_nan() {
+            continue;
+        }
+        let mut idx = if width > 0.0 {
+            ((v - min) / width).floor()
+        } else {
+            0.0
+        };
+        if idx < 0.0 {
+            idx = 0.0;
+        }
+        // CAST: f32 → usize via clamp, bounded by HISTOGRAM_N_BINS - 1 below
+        #[allow(
+            clippy::as_conversions,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        let mut bin = idx as usize;
+        if bin >= HISTOGRAM_N_BINS {
+            bin = HISTOGRAM_N_BINS - 1;
+        }
+        // INDEX: `bin` clamped to `< HISTOGRAM_N_BINS`; `counts` has exactly that length.
+        if let Some(slot) = counts.get_mut(bin) {
+            *slot += 1;
+        }
+    }
+    Histogram { bin_edges, counts }
+}
+
+/// Describe the device in a form suitable for provenance logging.
+fn describe_device(device: &candle_core::Device) -> String {
+    match device {
+        candle_core::Device::Cpu => "cpu".to_owned(),
+        candle_core::Device::Cuda(_) => "cuda:0".to_owned(),
+        candle_core::Device::Metal(_) => "metal".to_owned(),
+    }
+}
+
+// ── Main ────────────────────────────────────────────────────────────────────
+
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> candle_mi::Result<()> {
+    tracing_subscriber::fmt::init();
+    let args = Args::parse();
+
+    // BORROW: &str view of CLI-parsed Strings for match discrimination
+    let preset = resolve_family(args.family.as_str())?;
+    match args.schema.as_str() {
+        "clt" => run_step_a(&args, preset),
+        "both" => run_step_b(&args, preset),
+        other => Err(candle_mi::MIError::Config(format!(
+            "--schema must be `clt` (Step A) or `both` (Step B), got `{other}`"
+        ))),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Step A — CLT-only reference replication
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[allow(clippy::too_many_lines)]
+fn run_step_a(args: &Args, preset: &'static FamilyPreset) -> candle_mi::Result<()> {
+    let t_start = std::time::Instant::now();
+
+    let model_id = args.model(preset);
+    let clt_repo = args.clt_repo(preset);
+
+    eprintln!(
+        "=== Step A: CLT baseline ({}, {}) ===\n",
+        preset.name, model_id
+    );
+    eprintln!("Loading model: {model_id}");
+    let model = MIModel::from_pretrained(model_id)?;
+    let device = model.device().clone();
+    if !device.is_cuda() {
+        return Err(candle_mi::MIError::Config(
+            "Step A requires CUDA (the CLT vs PLT comparison must run on the \
+             same device family)."
+                .into(),
+        ));
+    }
+    let n_layers = model.num_layers();
+    let tokenizer = model
+        .tokenizer()
+        .ok_or_else(|| candle_mi::MIError::Tokenizer("model has no bundled tokenizer".into()))?;
+    eprintln!(
+        "  {n_layers} layers, {} hidden, device={device:?}",
+        model.hidden_size()
+    );
+
+    eprintln!("Opening CLT: {clt_repo}");
+    let mut clt = CrossLayerTranscoder::open(clt_repo)?;
+
+    let suppress_features: Vec<CltFeatureId> = preset
+        .suppress_features
+        .iter()
+        .copied()
+        .map(feature_id)
+        .collect();
+    let inject_feature = feature_id(preset.inject_feature);
+    // BORROW: clone() — owned Vec to pass separately from the expanded all-features list
+    let mut all_features: Vec<CltFeatureId> = suppress_features.clone();
+    all_features.push(inject_feature);
+
+    let prompt_with_space = format!("{} ", preset.prompt);
+    let token_ids = tokenizer.encode(&prompt_with_space)?;
+    let seq_len = token_ids.len();
+    let token_strs: Vec<String> = token_ids
+        .iter()
+        .map(|&id| {
+            tokenizer
+                .decode_token(id)
+                .unwrap_or_else(|_| format!("[{id}]"))
+        })
+        .collect();
+    eprintln!("Tokens ({seq_len}): {token_strs:?}");
+
+    let inject_token_id = tokenizer.find_token_id(preset.inject_word)?;
+    let inject_token_str = tokenizer.decode_token(inject_token_id)?;
+    eprintln!("Inject token: \"{inject_token_str}\" (id={inject_token_id})");
+
+    let top_k_target_layer = inject_feature.layer;
+    eprintln!(
+        "Ranking top-{} CLT features by cosine(decoder_row, unembed(\"{}\")) \
+         at layer {top_k_target_layer}...",
+        args.top_k, preset.inject_word
+    );
+    let direction = model.backend().embedding_vector(inject_token_id)?;
+    let top_k_scores =
+        clt.score_features_by_decoder_projection(&direction, top_k_target_layer, args.top_k, true)?;
+    let top_k_features: Vec<FeatureScore> = top_k_scores
+        .iter()
+        .map(|(fid, cos)| FeatureScore {
+            feature: *fid,
+            cosine: *cos,
+        })
+        .collect();
+    for (rank, fs) in top_k_features.iter().enumerate() {
+        eprintln!(
+            "  {:>2}. L{:<2}:{:<6}  cos={:+.4}",
+            rank + 1,
+            fs.feature.layer,
+            fs.feature.index,
+            fs.cosine
+        );
+    }
+
+    eprintln!("Caching decoder vectors for all downstream layers...");
+    clt.cache_steering_vectors_all_downstream(&all_features, &device)?;
+
+    let suppress_entries: Vec<(CltFeatureId, usize)> = suppress_features
+        .iter()
+        .flat_map(|feat| (feat.layer..n_layers).map(move |l| (*feat, l)))
+        .collect();
+    let inject_entries: Vec<(CltFeatureId, usize)> = (inject_feature.layer..n_layers)
+        .map(|l| (inject_feature, l))
+        .collect();
+
+    let input = Tensor::new(&token_ids[..], &device)?.unsqueeze(0)?;
+    let baseline_out = model.forward(&input, &HookSpec::new())?;
+    let baseline_prob = extract_token_prob(baseline_out.output(), inject_token_id)?;
+    let baseline_logit = extract_token_logit(baseline_out.output(), inject_token_id)?;
+    eprintln!(
+        "Baseline P(\"{inject_token_str}\") = {baseline_prob:.6e}  \
+         logit = {baseline_logit:+.6}"
+    );
+
+    eprintln!(
+        "\nSweeping {seq_len} positions (strength={})...",
+        args.strength
+    );
+    let sweep = sweep_suppress_inject(
+        &model,
+        &clt,
+        &input,
+        seq_len,
+        &token_strs,
+        &suppress_entries,
+        &inject_entries,
+        args.strength,
+        inject_token_id,
+        baseline_prob,
+        &device,
+        /*verbose=*/ true,
+    )?;
+
+    let (spike_position, spike) = pick_spike(&sweep)?;
+
+    if spike.prob < preset.spike_hard_min {
+        return Err(candle_mi::MIError::Config(format!(
+            "CLT sanity failed: max P(\"{}\") = {:.4} < hard-min {:.2}. \
+             Expected ~{:.3} (candle-mi reference; figure13_planning_poems.rs \
+             reproduces the same number). Check model/CLT repo pinning.",
+            preset.inject_word, spike.prob, preset.spike_hard_min, preset.reference_max_prob
+        )));
+    }
+    let band_diff = (spike.prob - preset.reference_max_prob).abs();
+    if band_diff > preset.reference_tol {
+        eprintln!(
+            "\nWARN: max_prob {:.4} drifted {band_diff:.4} from \
+             reference {:.3} (tol ±{:.2}).",
+            spike.prob, preset.reference_max_prob, preset.reference_tol
+        );
+    } else {
+        eprintln!(
+            "\nOK: max_prob {:.4} within ±{:.2} of reference {:.3}.",
+            spike.prob, preset.reference_tol, preset.reference_max_prob
+        );
+    }
+
+    let output_path = args
+        .output
+        .clone()
+        .unwrap_or_else(|| default_output_path(Step::A, preset));
+    let output = StepAOutput {
+        schema: "clt".into(),
+        model: model_id.to_owned(),
+        transcoder_repo: clt_repo.to_owned(),
+        prompt: preset.prompt.into(),
+        tokens: token_strs,
+        suppress_word: preset.suppress_word.into(),
+        inject_word: preset.inject_word.into(),
+        inject_token_id,
+        suppress_features,
+        inject_feature,
+        strength: args.strength,
+        top_k_target_layer,
+        top_k_features,
+        baseline_prob,
+        baseline_logit,
+        spike_position,
+        spike_token: spike.token.clone(),
+        max_prob: spike.prob,
+        max_logit: spike.logit,
+        delta_prob: spike.prob - baseline_prob,
+        delta_logit: spike.logit - baseline_logit,
+        reference_max_prob: preset.reference_max_prob,
+        reference_tolerance: preset.reference_tol,
+        sweep,
+    };
+    write_json(&output, &output_path)?;
+
+    eprintln!(
+        "\nSpike: pos {spike_position} (\"{}\"), P={:.4}, logit={:+.4}",
+        output.spike_token.replace('\n', "\\n"),
+        output.max_prob,
+        output.max_logit
+    );
+    eprintln!(
+        "ΔP = {:+.4}, Δlogit = {:+.4}",
+        output.delta_prob, output.delta_logit
+    );
+    eprintln!("Total elapsed: {:.2?}", t_start.elapsed());
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Step B — CLT + PLT method-matched comparison
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[allow(clippy::too_many_lines)]
+fn run_step_b(args: &Args, preset: &'static FamilyPreset) -> candle_mi::Result<()> {
+    let t_start = std::time::Instant::now();
+
+    let model_id = args.model(preset);
+    let clt_repo = args.clt_repo(preset);
+    let plt_repo = args.plt_repo(preset);
+
+    eprintln!(
+        "=== Step B: CLT vs PLT method-matched comparison ({}, {}) ===\n",
+        preset.name, model_id
+    );
+    eprintln!("Loading model: {model_id}");
+    let model = MIModel::from_pretrained(model_id)?;
+    let device = model.device().clone();
+    if !device.is_cuda() {
+        return Err(candle_mi::MIError::Config(
+            "Step B requires CUDA (the CLT vs PLT comparison must run on the \
+             same device family)."
+                .into(),
+        ));
+    }
+    let n_layers = model.num_layers();
+    let tokenizer = model
+        .tokenizer()
+        .ok_or_else(|| candle_mi::MIError::Tokenizer("model has no bundled tokenizer".into()))?;
+    eprintln!(
+        "  {n_layers} layers, {} hidden, device={device:?}",
+        model.hidden_size()
+    );
+
+    // --- Shared preamble: tokenize, direction, baseline ---
+    let prompt_with_space = format!("{} ", preset.prompt);
+    let token_ids = tokenizer.encode(&prompt_with_space)?;
+    let seq_len = token_ids.len();
+    let token_strs: Vec<String> = token_ids
+        .iter()
+        .map(|&id| {
+            tokenizer
+                .decode_token(id)
+                .unwrap_or_else(|_| format!("[{id}]"))
+        })
+        .collect();
+    eprintln!("Tokens ({seq_len}): {token_strs:?}");
+
+    let inject_token_id = tokenizer.find_token_id(preset.inject_word)?;
+    let inject_token_str = tokenizer.decode_token(inject_token_id)?;
+    eprintln!("Inject token: \"{inject_token_str}\" (id={inject_token_id})");
+
+    let direction = model.backend().embedding_vector(inject_token_id)?;
+
+    let input = Tensor::new(&token_ids[..], &device)?.unsqueeze(0)?;
+
+    // --- One baseline forward with the family's required hook captures ---
+    // CLT always reads from `ResidMid`. The PLT side reads from
+    // `preset.plt_input_hook` — `ResidMid` for Llama PltBundle (same as CLT,
+    // residuals shared) or `MlpPre` for GemmaScope (post-LN2; captured
+    // separately). When the two coincide we reuse one capture set.
+    let plt_uses_distinct_hook = preset.plt_input_hook != PltInputHook::ResidMid;
+    eprintln!(
+        "\nCapturing baseline residuals at every layer ({} hook{})...",
+        if plt_uses_distinct_hook {
+            "ResidMid + PLT-specific"
+        } else {
+            "ResidMid only"
+        },
+        if plt_uses_distinct_hook { "s" } else { "" }
+    );
+    let mut capture_spec = HookSpec::new();
+    for layer in 0..n_layers {
+        capture_spec.capture(HookPoint::ResidMid(layer));
+        if plt_uses_distinct_hook {
+            capture_spec.capture(preset.plt_input_hook.at(layer));
+        }
+    }
+    let baseline_cache = model.forward(&input, &capture_spec)?;
+    let baseline_prob = extract_token_prob(baseline_cache.output(), inject_token_id)?;
+    let baseline_logit = extract_token_logit(baseline_cache.output(), inject_token_id)?;
+    eprintln!(
+        "Baseline P(\"{inject_token_str}\") = {baseline_prob:.6e}  \
+         logit = {baseline_logit:+.6}"
+    );
+    // BORROW: clone() — detach per-layer residual tensors from the HookCache
+    // so we can drop the cache once the two arms start running.
+    let mut clt_residuals: Vec<Tensor> = Vec::with_capacity(n_layers);
+    let mut plt_residuals: Vec<Tensor> = Vec::with_capacity(n_layers);
+    for layer in 0..n_layers {
+        let resid_mid = baseline_cache
+            .get(&HookPoint::ResidMid(layer))
+            .ok_or_else(|| {
+                candle_mi::MIError::Config(format!(
+                    "HookCache missing ResidMid({layer}) — capture_spec wiring bug"
+                ))
+            })?
+            .clone();
+        if plt_uses_distinct_hook {
+            let plt_hook = preset.plt_input_hook.at(layer);
+            let plt_resid = baseline_cache
+                .get(&plt_hook)
+                .ok_or_else(|| {
+                    candle_mi::MIError::Config(format!(
+                        "HookCache missing {plt_hook:?} — capture_spec wiring bug"
+                    ))
+                })?
+                .clone();
+            plt_residuals.push(plt_resid);
+        } else {
+            // BORROW: clone() — Tensor is Arc-backed; cheap shared handle.
+            plt_residuals.push(resid_mid.clone());
+        }
+        clt_residuals.push(resid_mid);
+    }
+    drop(baseline_cache);
+
+    // Top-K target layer = the (paper-derived) layer where the inject
+    // feature lives. Llama: 14. Gemma: 22.
+    let top_k_target_layer: usize = preset.inject_feature.0;
+    let suppress_inject_strength = args.strength;
+
+    // --- CLT arm ---
+    eprintln!("\n── CLT arm ({clt_repo}) ──");
+    let clt_arm = run_arm_step_b(
+        "clt",
+        clt_repo,
+        &model,
+        &clt_residuals,
+        &input,
+        seq_len,
+        &token_strs,
+        inject_token_id,
+        preset.inject_word,
+        &direction,
+        baseline_prob,
+        baseline_logit,
+        suppress_inject_strength,
+        top_k_target_layer,
+        n_layers,
+        /*include_max_over_target=*/ true,
+        /*plt_has_w_skip=*/ false, // CLT arm never has W_skip
+        &device,
+    )?;
+
+    // --- PLT arm ---
+    eprintln!("\n── PLT arm ({plt_repo}) ──");
+    let plt_arm = run_arm_step_b(
+        "plt",
+        plt_repo,
+        &model,
+        &plt_residuals,
+        &input,
+        seq_len,
+        &token_strs,
+        inject_token_id,
+        preset.inject_word,
+        &direction,
+        baseline_prob,
+        baseline_logit,
+        suppress_inject_strength,
+        top_k_target_layer,
+        n_layers,
+        /*include_max_over_target=*/ false,
+        /*plt_has_w_skip=*/ preset.plt_has_w_skip,
+        &device,
+    )?;
+
+    // NOTE: Step B does NOT reuse Step A's reference_max_prob gate. That
+    // reference was for Step A's reference protocol (cross-layer suppress
+    // features). Step B uses decoder-projection-derived top-5 suppress
+    // features at the target layer, producing a numerically different signal
+    // even with the same transcoder. The gate field in the output JSON
+    // records this intentionally (clt_suppress_inject_gate_triggered=false,
+    // no reference).
+    let clt_gate_triggered = false;
+
+    let runtime_seconds = t_start.elapsed().as_secs_f64();
+    let output_path = args
+        .output
+        .clone()
+        .unwrap_or_else(|| default_output_path(Step::B, preset));
+    let output = StepBOutput {
+        experiment: "clt-vs-plt-planning-site",
+        step: "b",
+        runtime_seconds,
+        device_name: describe_device(&device),
+        model: model_id.to_owned(),
+        prompt: preset.prompt.into(),
+        tokens: token_strs,
+        inject_word: preset.inject_word.into(),
+        inject_token_id,
+        top_k_target_layer,
+        baseline_prob,
+        baseline_logit,
+        arms: ArmOutputs {
+            clt: clt_arm,
+            plt: plt_arm,
+        },
+        sanity_gates: SanityGates {
+            clt_reference_max_prob: preset.reference_max_prob,
+            clt_reference_tolerance: preset.reference_tol,
+            clt_hard_min: preset.spike_hard_min,
+            clt_suppress_inject_gate_triggered: clt_gate_triggered,
+            plt_reference_max_prob: None,
+        },
+    };
+    write_json(&output, &output_path)?;
+
+    eprintln!("\n=== Step B complete ===");
+    eprintln!(
+        "  CLT suppress-only    ΔP = {:+.6e}  Δlogit = {:+.4}  spike pos {}",
+        output.arms.clt.suppress_only.delta_prob,
+        output.arms.clt.suppress_only.delta_logit,
+        output.arms.clt.suppress_only.spike_position
+    );
+    eprintln!(
+        "  CLT suppress+inject  ΔP = {:+.6e}  Δlogit = {:+.4}  spike pos {}",
+        output.arms.clt.suppress_inject.delta_prob,
+        output.arms.clt.suppress_inject.delta_logit,
+        output.arms.clt.suppress_inject.spike_position
+    );
+    eprintln!(
+        "  PLT suppress-only    ΔP = {:+.6e}  Δlogit = {:+.4}  spike pos {}",
+        output.arms.plt.suppress_only.delta_prob,
+        output.arms.plt.suppress_only.delta_logit,
+        output.arms.plt.suppress_only.spike_position
+    );
+    eprintln!(
+        "  PLT suppress+inject  ΔP = {:+.6e}  Δlogit = {:+.4}  spike pos {}",
+        output.arms.plt.suppress_inject.delta_prob,
+        output.arms.plt.suppress_inject.delta_logit,
+        output.arms.plt.suppress_inject.spike_position
+    );
+    if let Some(ref mot) = output.arms.clt.max_over_target_follow_up {
+        eprintln!("  --- Follow-up 1: CLT max-over-target suppress ---");
+        eprintln!(
+            "  CLT mot suppress-only        ΔP = {:+.6e}  Δlogit = {:+.4}  spike pos {}",
+            mot.suppress_only.delta_prob,
+            mot.suppress_only.delta_logit,
+            mot.suppress_only.spike_position
+        );
+        eprintln!(
+            "  CLT mot suppress+inject (r)  ΔP = {:+.6e}  Δlogit = {:+.4}  spike pos {}",
+            mot.suppress_inject_ranked_inject.delta_prob,
+            mot.suppress_inject_ranked_inject.delta_logit,
+            mot.suppress_inject_ranked_inject.spike_position
+        );
+        eprintln!(
+            "  CLT mot suppress+inject (s)  ΔP = {:+.6e}  Δlogit = {:+.4}  spike pos {}",
+            mot.suppress_inject_same_inject.delta_prob,
+            mot.suppress_inject_same_inject.delta_logit,
+            mot.suppress_inject_same_inject.spike_position
+        );
+    }
+    eprintln!("Total elapsed: {runtime_seconds:.2?}s");
+    Ok(())
+}
+
+/// Run the per-arm Step B pipeline. Consumes one transcoder, produces one
+/// `ArmOutput`. The model residuals are shared between arms.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn run_arm_step_b(
+    arm_label: &str,
+    repo: &str,
+    model: &MIModel,
+    residuals: &[Tensor],
+    input: &Tensor,
+    seq_len: usize,
+    token_strs: &[String],
+    inject_token_id: u32,
+    inject_word: &str,
+    direction: &Tensor,
+    baseline_prob: f32,
+    baseline_logit: f32,
+    strength: f32,
+    top_k_target_layer: usize,
+    n_layers: usize,
+    include_max_over_target: bool,
+    plt_has_w_skip: bool,
+    device: &candle_core::Device,
+) -> candle_mi::Result<ArmOutput> {
+    let t_arm = std::time::Instant::now();
+
+    eprintln!("Opening transcoder: {repo}");
+    let mut transcoder = CrossLayerTranscoder::open(repo)?;
+    let n_features_per_layer = transcoder.config().n_features_per_layer;
+
+    // --- Top-20 same-layer ranking ---
+    eprintln!(
+        "  Ranking top-{STEP_B_TOP_N} features by cosine(decoder_row, unembed(\"{inject_word}\")) \
+         at layer {top_k_target_layer}..."
+    );
+    let top_20_scores = transcoder.score_features_by_decoder_projection(
+        direction,
+        top_k_target_layer,
+        STEP_B_TOP_N,
+        true,
+    )?;
+    let top_20_features_same_layer: Vec<FeatureScore> = top_20_scores
+        .iter()
+        .map(|(fid, cos)| FeatureScore {
+            feature: *fid,
+            cosine: *cos,
+        })
+        .collect();
+    for (rank, fs) in top_20_features_same_layer.iter().take(5).enumerate() {
+        eprintln!(
+            "    {:>2}. L{:<2}:{:<6}  cos={:+.4}",
+            rank + 1,
+            fs.feature.layer,
+            fs.feature.index,
+            fs.cosine
+        );
+    }
+
+    // --- Top-20 max-over-target-layers (CLT only) ---
+    let top_20_features_max_over_target = if include_max_over_target {
+        eprintln!(
+            "  Ranking top-{STEP_B_TOP_N} features by max cosine across target layers \
+             0..{n_layers} (CLT slice-ambiguity control)..."
+        );
+        Some(rank_top_k_max_over_target(
+            &mut transcoder,
+            direction,
+            n_layers,
+            STEP_B_TOP_N,
+        )?)
+    } else {
+        None
+    };
+
+    // --- Top-20 decoder vectors (same-layer) ---
+    eprintln!("  Extracting top-{STEP_B_TOP_N} decoder vectors at layer {top_k_target_layer}...");
+    let top_20_fids: Vec<CltFeatureId> = top_20_features_same_layer
+        .iter()
+        .map(|fs| fs.feature)
+        .collect();
+    let dec_map = transcoder.extract_decoder_vectors(&top_20_fids, top_k_target_layer)?;
+    let mut top_20_decoder_vectors_same_layer: Vec<Vec<f32>> = Vec::with_capacity(STEP_B_TOP_N);
+    for fid in &top_20_fids {
+        let tensor = dec_map.get(fid).ok_or_else(|| {
+            candle_mi::MIError::Config(format!("extract_decoder_vectors missed feature {fid:?}"))
+        })?;
+        // BORROW: .to_vec1()? moves tensor values from CPU to an owned Vec<f32>
+        top_20_decoder_vectors_same_layer.push(tensor.to_vec1::<f32>()?);
+    }
+
+    // --- All-layer activation trace for top-20 features ---
+    eprintln!("  Building {STEP_B_TOP_N}×{n_layers}×{seq_len} activation trace...");
+    let all_layer_activation_trace = build_activation_trace(
+        &mut transcoder,
+        residuals,
+        &top_20_fids,
+        n_layers,
+        seq_len,
+        device,
+    )?;
+
+    // --- Pre-activation histograms at spike layer ± 1 ---
+    eprintln!("  Computing pre-activation histograms at L{top_k_target_layer} ± 1...");
+    let pre_activation_histograms = build_pre_activation_histograms(
+        &mut transcoder,
+        residuals,
+        top_k_target_layer,
+        seq_len,
+        n_layers,
+        device,
+    )?;
+
+    // --- PLT W_skip projection (PLT arm with W_skip-bearing transcoder only) ---
+    // Uses `seq_len - 1` (the trailing-space position that follows the prompt)
+    // as the structural planning site: on rhyming-couplet prompts the model
+    // commits to the rhyme at the last residual-input position before
+    // sampling, not at the position the sweep detects maximum intervention
+    // sensitivity. Empirically on the Llama prompt both sweep spikes also land
+    // at `seq_len - 1`, so the two choices coincide there; documenting the
+    // structural pick because a different prompt could dissociate them.
+    //
+    // GemmaScope is a pure JumpReLU transcoder with no W_skip path
+    // (`plt_has_w_skip = false`), so the projection field is `None` for that
+    // arm — the field is preserved in the output JSON for cross-family
+    // structural compatibility.
+    let w_skip_projection_at_spike = if arm_label == "plt" && plt_has_w_skip {
+        eprintln!(
+            "  Computing W_skip · residual[seq_len - 1] projection onto unembed(\"{inject_word}\")..."
+        );
+        Some(compute_w_skip_projection(
+            &mut transcoder,
+            residuals,
+            direction,
+            top_k_target_layer,
+            seq_len - 1,
+            device,
+        )?)
+    } else {
+        None
+    };
+
+    // --- Suppress and inject feature selection (top-5 + top-1 from same-layer ranking) ---
+    let suppress_features: Vec<CltFeatureId> = top_20_features_same_layer
+        .iter()
+        .take(DEFAULT_TOP_K)
+        .map(|fs| fs.feature)
+        .collect();
+    let inject_feature = top_20_features_same_layer
+        .first()
+        .map(|fs| fs.feature)
+        .ok_or_else(|| candle_mi::MIError::Config("top-20 ranking returned 0 features".into()))?;
+
+    // Cache decoder vectors for both protocols (suppress + inject across all downstream).
+    let mut all_cache_features: Vec<CltFeatureId> = suppress_features.clone();
+    all_cache_features.push(inject_feature);
+    eprintln!("  Caching decoder vectors for suppress+inject features...");
+    transcoder.cache_steering_vectors_all_downstream(&all_cache_features, device)?;
+
+    // Per-layer schemas (PltBundle) cache a single entry per feature (at its
+    // own source layer); cross-layer schemas (CltSplit) cache one entry per
+    // downstream target. Intervention entries must match the cache structure.
+    let is_cross_layer = transcoder.config().schema.is_cross_layer();
+    let suppress_entries: Vec<(CltFeatureId, usize)> = if is_cross_layer {
+        suppress_features
+            .iter()
+            .flat_map(|feat| (feat.layer..n_layers).map(move |l| (*feat, l)))
+            .collect()
+    } else {
+        suppress_features
+            .iter()
+            .map(|feat| (*feat, feat.layer))
+            .collect()
+    };
+    let inject_entries: Vec<(CltFeatureId, usize)> = if is_cross_layer {
+        (inject_feature.layer..n_layers)
+            .map(|l| (inject_feature, l))
+            .collect()
+    } else {
+        vec![(inject_feature, inject_feature.layer)]
+    };
+
+    // --- Causal test 1: suppress-only ---
+    eprintln!("  Sweeping {seq_len} positions (suppress-only, strength={strength})...");
+    let sweep_only_positions = sweep_suppress_only(
+        model,
+        &transcoder,
+        input,
+        seq_len,
+        token_strs,
+        &suppress_entries,
+        strength,
+        inject_token_id,
+        device,
+    )?;
+    let (spike_only_pos, spike_only) = pick_spike(&sweep_only_positions)?;
+    let suppress_only = CausalTestResult {
+        protocol: "suppress_only".into(),
+        suppress_features: suppress_features.clone(),
+        inject_feature: None,
+        strength,
+        spike_position: spike_only_pos,
+        spike_token: spike_only.token.clone(),
+        max_prob: spike_only.prob,
+        max_logit: spike_only.logit,
+        delta_prob: spike_only.prob - baseline_prob,
+        delta_logit: spike_only.logit - baseline_logit,
+        sweep: sweep_only_positions,
+    };
+
+    // --- Causal test 2: suppress + inject ---
+    eprintln!("  Sweeping {seq_len} positions (suppress+inject, strength={strength})...");
+    let sweep_inject_positions = sweep_suppress_inject(
+        model,
+        &transcoder,
+        input,
+        seq_len,
+        token_strs,
+        &suppress_entries,
+        &inject_entries,
+        strength,
+        inject_token_id,
+        baseline_prob,
+        device,
+        /*verbose=*/ false,
+    )?;
+    let (spike_inject_pos, spike_inject) = pick_spike(&sweep_inject_positions)?;
+    let suppress_inject = CausalTestResult {
+        protocol: "suppress_inject".into(),
+        suppress_features,
+        inject_feature: Some(inject_feature),
+        strength,
+        spike_position: spike_inject_pos,
+        spike_token: spike_inject.token.clone(),
+        max_prob: spike_inject.prob,
+        max_logit: spike_inject.logit,
+        delta_prob: spike_inject.prob - baseline_prob,
+        delta_logit: spike_inject.logit - baseline_logit,
+        sweep: sweep_inject_positions,
+    };
+
+    // --- Follow-up 1: re-run CLT suppression with max-over-target top-5 ---
+    // Tests whether the arm asymmetry on Llama 3.2 1B (PLT ΔP ≈ +0.986 vs
+    // method-matched CLT ΔP ≈ 5e-7) is a ranking-method artefact rather
+    // than a transcoder-class limitation. Three sweeps:
+    //   1. suppress-only — top-5 from max-over-target ranking, no inject.
+    //   2. suppress+inject with inject also from max-over-target top-1
+    //      (fully method-matched).
+    //   3. suppress+inject with inject held constant at the same-layer
+    //      top-1 (isolates the effect of swapping the suppress set alone).
+    // PLT gets None here because the max-over-target metric has only one
+    // slice by construction (PltBundle decodes only to its own layer).
+    let max_over_target_follow_up = if let Some(ref max_ranking) = top_20_features_max_over_target {
+        eprintln!(
+            "  [Follow-up 1] Max-over-target CLT ranking — 3 extra sweeps to test \
+             ranking-method vs transcoder-class attribution..."
+        );
+        let mot_suppress_features: Vec<CltFeatureId> = max_ranking
+            .iter()
+            .take(DEFAULT_TOP_K)
+            .map(|fs| fs.feature)
+            .collect();
+        let mot_inject_feature = max_ranking.first().map(|fs| fs.feature).ok_or_else(|| {
+            candle_mi::MIError::Config("max-over-target ranking returned 0 features".into())
+        })?;
+
+        // Extend the steering cache with the new features.
+        // BORROW: clone() — union of new features for a second cache call.
+        let mut mot_cache: Vec<CltFeatureId> = mot_suppress_features.clone();
+        mot_cache.push(mot_inject_feature);
+        eprintln!("    Caching decoder vectors for max-over-target features...");
+        transcoder.cache_steering_vectors_all_downstream(&mot_cache, device)?;
+
+        // Build intervention entries. Max-over-target features come from a
+        // cross-layer schema (CltSplit) by construction — expand across all
+        // downstream target layers.
+        let mot_suppress_entries: Vec<(CltFeatureId, usize)> = mot_suppress_features
+            .iter()
+            .flat_map(|feat| (feat.layer..n_layers).map(move |l| (*feat, l)))
+            .collect();
+        let mot_inject_ranked_entries: Vec<(CltFeatureId, usize)> = (mot_inject_feature.layer
+            ..n_layers)
+            .map(|l| (mot_inject_feature, l))
+            .collect();
+
+        // (1) suppress-only.
+        eprintln!("    Sweep 1/3 — suppress-only (max-over-target top-5, no inject)...");
+        let sweep_mot_so = sweep_suppress_only(
+            model,
+            &transcoder,
+            input,
+            seq_len,
+            token_strs,
+            &mot_suppress_entries,
+            strength,
+            inject_token_id,
+            device,
+        )?;
+        let (mot_so_pos, mot_so_spike) = pick_spike(&sweep_mot_so)?;
+        let suppress_only_mot = CausalTestResult {
+            protocol: "suppress_only_max_over_target".into(),
+            // BORROW: clone() — mot_suppress_features is reused in the next two tests.
+            suppress_features: mot_suppress_features.clone(),
+            inject_feature: None,
+            strength,
+            spike_position: mot_so_pos,
+            spike_token: mot_so_spike.token.clone(),
+            max_prob: mot_so_spike.prob,
+            max_logit: mot_so_spike.logit,
+            delta_prob: mot_so_spike.prob - baseline_prob,
+            delta_logit: mot_so_spike.logit - baseline_logit,
+            sweep: sweep_mot_so,
+        };
+
+        // (2) suppress+inject, inject drawn from max-over-target top-1.
+        eprintln!(
+            "    Sweep 2/3 — suppress+inject (max-over-target top-5 + max-over-target top-1 inject)..."
+        );
+        let sweep_mot_si_ranked = sweep_suppress_inject(
+            model,
+            &transcoder,
+            input,
+            seq_len,
+            token_strs,
+            &mot_suppress_entries,
+            &mot_inject_ranked_entries,
+            strength,
+            inject_token_id,
+            baseline_prob,
+            device,
+            /*verbose=*/ false,
+        )?;
+        let (mot_ranked_pos, mot_ranked_spike) = pick_spike(&sweep_mot_si_ranked)?;
+        let suppress_inject_ranked = CausalTestResult {
+            protocol: "suppress_inject_max_over_target_ranked_inject".into(),
+            // BORROW: clone() — mot_suppress_features is reused once more below.
+            suppress_features: mot_suppress_features.clone(),
+            inject_feature: Some(mot_inject_feature),
+            strength,
+            spike_position: mot_ranked_pos,
+            spike_token: mot_ranked_spike.token.clone(),
+            max_prob: mot_ranked_spike.prob,
+            max_logit: mot_ranked_spike.logit,
+            delta_prob: mot_ranked_spike.prob - baseline_prob,
+            delta_logit: mot_ranked_spike.logit - baseline_logit,
+            sweep: sweep_mot_si_ranked,
+        };
+
+        // (3) suppress+inject, inject held constant at same-layer top-1.
+        // Reuses `inject_entries` built earlier from `inject_feature`
+        // (top-20 same-layer top-1); only the suppress set changes.
+        eprintln!(
+            "    Sweep 3/3 — suppress+inject (max-over-target top-5 + same-layer top-1 inject, held constant)..."
+        );
+        let sweep_mot_si_same = sweep_suppress_inject(
+            model,
+            &transcoder,
+            input,
+            seq_len,
+            token_strs,
+            &mot_suppress_entries,
+            &inject_entries,
+            strength,
+            inject_token_id,
+            baseline_prob,
+            device,
+            /*verbose=*/ false,
+        )?;
+        let (mot_held_pos, mot_held_spike) = pick_spike(&sweep_mot_si_same)?;
+        let suppress_inject_same = CausalTestResult {
+            protocol: "suppress_inject_max_over_target_same_inject".into(),
+            suppress_features: mot_suppress_features,
+            inject_feature: Some(inject_feature),
+            strength,
+            spike_position: mot_held_pos,
+            spike_token: mot_held_spike.token.clone(),
+            max_prob: mot_held_spike.prob,
+            max_logit: mot_held_spike.logit,
+            delta_prob: mot_held_spike.prob - baseline_prob,
+            delta_logit: mot_held_spike.logit - baseline_logit,
+            sweep: sweep_mot_si_same,
+        };
+
+        Some(MaxOverTargetFollowUp {
+            suppress_only: suppress_only_mot,
+            suppress_inject_ranked_inject: suppress_inject_ranked,
+            suppress_inject_same_inject: suppress_inject_same,
+        })
+    } else {
+        None
+    };
+
+    eprintln!(
+        "  Arm elapsed: {:.2?}  (suppress-only ΔP={:+.6e}, suppress+inject ΔP={:+.6e})",
+        t_arm.elapsed(),
+        suppress_only.delta_prob,
+        suppress_inject.delta_prob
+    );
+
+    Ok(ArmOutput {
+        schema: arm_label.into(),
+        transcoder_repo: repo.into(),
+        n_layers,
+        n_features_per_layer,
+        top_20_features_same_layer,
+        top_20_features_max_over_target,
+        top_20_decoder_vectors_same_layer,
+        pre_activation_histograms,
+        all_layer_activation_trace,
+        w_skip_projection_at_spike,
+        suppress_only,
+        suppress_inject,
+        max_over_target_follow_up,
+    })
+}
+
+/// Rank the top-`k` features by max cosine across all downstream target
+/// layers. Loop pattern borrowed from `examples/clt_probe.rs:476-500`.
+fn rank_top_k_max_over_target(
+    transcoder: &mut CrossLayerTranscoder,
+    direction: &Tensor,
+    n_layers: usize,
+    k: usize,
+) -> candle_mi::Result<Vec<FeatureScore>> {
+    let mut all_hits: Vec<(CltFeatureId, f32)> = Vec::new();
+    for target_layer in 0..n_layers {
+        // Ask for up to `k` per target layer (more than enough for the global top-k).
+        let hits =
+            transcoder.score_features_by_decoder_projection(direction, target_layer, k, true)?;
+        for (fid, cosine) in hits {
+            if let Some(existing) = all_hits.iter_mut().find(|(f, _)| *f == fid) {
+                if cosine > existing.1 {
+                    existing.1 = cosine;
+                }
+            } else {
+                all_hits.push((fid, cosine));
+            }
+        }
+    }
+    all_hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    all_hits.truncate(k);
+    Ok(all_hits
+        .into_iter()
+        .map(|(feature, cosine)| FeatureScore { feature, cosine })
+        .collect())
+}
+
+/// For each of `features`, record the post-`ReLU` activation at every
+/// `(layer, position)`. Uses `encode` (sparse) and materialises 0.0 for
+/// features absent from the sparse output.
+//
+// The triple nested `Vec<Vec<Vec<f32>>>` is pre-allocated at a known
+// `[n_features][n_layers][seq_len]` shape and every `slot`, `layer`, `pos`
+// write uses indices produced from the same-length iteration counters. The
+// three `indexing_slicing` hits on `values[slot][layer][pos] = *act` are
+// noise at this callsite, and `needless_range_loop` on the two outer loops
+// is unavoidable because the iteration counter is also used to drive the
+// transcoder's stateful `load_encoder(layer)` side effect (not just to index
+// `values`). Suppress both intentionally.
+#[allow(clippy::indexing_slicing, clippy::needless_range_loop)]
+fn build_activation_trace(
+    transcoder: &mut CrossLayerTranscoder,
+    residuals: &[Tensor],
+    features: &[CltFeatureId],
+    n_layers: usize,
+    seq_len: usize,
+    device: &candle_core::Device,
+) -> candle_mi::Result<ActivationTrace> {
+    let n_features = features.len();
+    // Pre-allocate [feature][layer][position] = 0.0.
+    let mut values: Vec<Vec<Vec<f32>>> = vec![vec![vec![0.0_f32; seq_len]; n_layers]; n_features];
+
+    let feature_to_slot: HashMap<CltFeatureId, usize> = features
+        .iter()
+        .enumerate()
+        .map(|(i, fid)| (*fid, i))
+        .collect();
+
+    for layer in 0..n_layers {
+        transcoder.load_encoder(layer, device)?;
+        let layer_res = residuals.get(layer).ok_or_else(|| {
+            candle_mi::MIError::Config(format!("residuals missing layer {layer}"))
+        })?;
+        for pos in 0..seq_len {
+            let residual = layer_res.i((0, pos))?;
+            let sparse = transcoder.encode(&residual, layer)?;
+            for (fid, act) in &sparse.features {
+                if let Some(&slot) = feature_to_slot.get(fid) {
+                    // INDEX: slot < n_features; layer < n_layers; pos < seq_len — all guarded above.
+                    values[slot][layer][pos] = *act;
+                }
+            }
+        }
+    }
+
+    Ok(ActivationTrace {
+        feature_ids: features.to_vec(),
+        layer_indices: (0..n_layers).collect(),
+        positions: (0..seq_len).collect(),
+        values,
+    })
+}
+
+/// Compute `HISTOGRAM_N_BINS`-bin pre-activation histograms at the spike
+/// layer and its two neighbours. Flattens all `(position, feature)`
+/// pre-activation values per layer into one histogram.
+fn build_pre_activation_histograms(
+    transcoder: &mut CrossLayerTranscoder,
+    residuals: &[Tensor],
+    spike_layer: usize,
+    seq_len: usize,
+    n_layers: usize,
+    device: &candle_core::Device,
+) -> candle_mi::Result<HashMap<String, Histogram>> {
+    let mut histograms: HashMap<String, Histogram> = HashMap::new();
+
+    for &offset in HISTOGRAM_NEIGHBOUR_OFFSETS {
+        // CAST: i64 → isize for signed arithmetic; HISTOGRAM_NEIGHBOUR_OFFSETS is {-1, 0, 1}, trivially in range
+        #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+        let offset_isize = offset as isize;
+        // CAST: usize → isize for signed arithmetic; spike_layer is a layer index, fits easily
+        #[allow(clippy::as_conversions, clippy::cast_possible_wrap)]
+        let target_signed = spike_layer as isize + offset_isize;
+        if target_signed < 0 {
+            continue;
+        }
+        // CAST: isize → usize after positivity check above
+        #[allow(clippy::as_conversions, clippy::cast_sign_loss)]
+        let target_layer = target_signed as usize;
+        if target_layer >= n_layers {
+            continue;
+        }
+
+        transcoder.load_encoder(target_layer, device)?;
+        let layer_res = residuals.get(target_layer).ok_or_else(|| {
+            candle_mi::MIError::Config(format!("residuals missing layer {target_layer}"))
+        })?;
+
+        // Collect flattened pre-activations across all positions for this layer.
+        let mut flat: Vec<f32> = Vec::new();
+        for pos in 0..seq_len {
+            let residual = layer_res.i((0, pos))?;
+            let pre = transcoder.encode_pre_activation(&residual, target_layer)?;
+            let mut v: Vec<f32> = pre.to_vec1()?;
+            flat.append(&mut v);
+        }
+
+        // Min/max bin edges so every value lands inside.
+        let (mn, mx) = flat
+            .iter()
+            .filter(|v| !v.is_nan())
+            .copied()
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), x| {
+                (lo.min(x), hi.max(x))
+            });
+        let (mn, mx) = if mn.is_finite() && mx.is_finite() && mx > mn {
+            (mn, mx)
+        } else {
+            (0.0, 1.0)
+        };
+
+        histograms.insert(
+            format!("layer_{target_layer}"),
+            fixed_edge_histogram(&flat, mn, mx),
+        );
+    }
+
+    Ok(histograms)
+}
+
+/// Compute `(W_skip @ residual_at_spike) · direction` for the PLT arm.
+fn compute_w_skip_projection(
+    transcoder: &mut CrossLayerTranscoder,
+    residuals: &[Tensor],
+    direction: &Tensor,
+    spike_layer: usize,
+    spike_position: usize,
+    device: &candle_core::Device,
+) -> candle_mi::Result<f32> {
+    let w_skip = transcoder.load_skip_matrix(spike_layer, device)?;
+    let layer_res = residuals.get(spike_layer).ok_or_else(|| {
+        candle_mi::MIError::Config(format!("residuals missing layer {spike_layer}"))
+    })?;
+    let residual = layer_res.i((0, spike_position))?;
+    // PROMOTE: residual may arrive BF16/F16; F32 to match W_skip's F32.
+    let residual_f32 = residual.to_dtype(DType::F32)?;
+    // W_skip @ residual → [d_model]
+    let skip_vec = w_skip.matmul(&residual_f32.unsqueeze(1)?)?.squeeze(1)?;
+    // direction is on the model device, skip_vec on `device` (same). Project.
+    // PROMOTE: direction may be F16/BF16 from embedding_vector.
+    let direction_f32 = direction.to_dtype(DType::F32)?;
+    let dot = (&skip_vec * &direction_f32)?
+        .sum_all()?
+        .to_scalar::<f32>()?;
+    Ok(dot)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Shared sweep helpers
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[allow(clippy::too_many_arguments)]
+fn sweep_suppress_inject(
+    model: &MIModel,
+    transcoder: &CrossLayerTranscoder,
+    input: &Tensor,
+    seq_len: usize,
+    token_strs: &[String],
+    suppress_entries: &[(CltFeatureId, usize)],
+    inject_entries: &[(CltFeatureId, usize)],
+    strength: f32,
+    inject_token_id: u32,
+    baseline_prob: f32,
+    device: &candle_core::Device,
+    verbose: bool,
+) -> candle_mi::Result<Vec<PositionResult>> {
+    let mut sweep: Vec<PositionResult> = Vec::with_capacity(seq_len);
+    for pos in 0..seq_len {
+        let mut combined =
+            transcoder.prepare_hook_injection(suppress_entries, pos, seq_len, -strength, device)?;
+        let inject_hooks =
+            transcoder.prepare_hook_injection(inject_entries, pos, seq_len, strength, device)?;
+        combined.extend(&inject_hooks);
+        let result = model.forward(input, &combined)?;
+        let prob = extract_token_prob(result.output(), inject_token_id)?;
+        let logit = extract_token_logit(result.output(), inject_token_id)?;
+        // BORROW: String::clone — owned token string for the sweep entry.
+        let token = token_strs.get(pos).map_or_else(String::new, String::clone);
+        if verbose {
+            let display = token.replace('\n', "\\n");
+            eprintln!(
+                "    pos {pos:>3}  {display:<20}  P={prob:.6e}  logit={logit:+.4}  \
+                 ΔP={:+.6e}",
+                prob - baseline_prob
+            );
+        }
+        sweep.push(PositionResult {
+            position: pos,
+            token,
+            prob,
+            logit,
+        });
+    }
+    Ok(sweep)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sweep_suppress_only(
+    model: &MIModel,
+    transcoder: &CrossLayerTranscoder,
+    input: &Tensor,
+    seq_len: usize,
+    token_strs: &[String],
+    suppress_entries: &[(CltFeatureId, usize)],
+    strength: f32,
+    inject_token_id: u32,
+    device: &candle_core::Device,
+) -> candle_mi::Result<Vec<PositionResult>> {
+    let mut sweep: Vec<PositionResult> = Vec::with_capacity(seq_len);
+    for pos in 0..seq_len {
+        let hooks =
+            transcoder.prepare_hook_injection(suppress_entries, pos, seq_len, -strength, device)?;
+        let result = model.forward(input, &hooks)?;
+        let prob = extract_token_prob(result.output(), inject_token_id)?;
+        let logit = extract_token_logit(result.output(), inject_token_id)?;
+        // BORROW: String::clone — owned token string for the sweep entry.
+        let token = token_strs.get(pos).map_or_else(String::new, String::clone);
+        sweep.push(PositionResult {
+            position: pos,
+            token,
+            prob,
+            logit,
+        });
+    }
+    Ok(sweep)
+}
+
+/// Return `(index_of_max, &entry)` over a non-empty sweep. Uses `.get()`
+/// on the index for the `indexing_slicing` lint; the Err arm is unreachable
+/// because `spike_idx` was just produced by `.max_by()` on the same slice.
+fn pick_spike(sweep: &[PositionResult]) -> candle_mi::Result<(usize, &PositionResult)> {
+    let spike_idx = sweep
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| {
+            a.prob
+                .partial_cmp(&b.prob)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(i, _)| i)
+        .ok_or_else(|| candle_mi::MIError::Config("empty sweep".into()))?;
+    // INDEX: spike_idx produced by max_by over the same slice; Err arm unreachable.
+    let spike = sweep
+        .get(spike_idx)
+        .ok_or_else(|| candle_mi::MIError::Config("spike index out of range".into()))?;
+    Ok((spike_idx, spike))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Output
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn write_json<T: Serialize>(output: &T, path: &Path) -> candle_mi::Result<()> {
+    let json = serde_json::to_string_pretty(output)
+        .map_err(|e| candle_mi::MIError::Config(format!("JSON serialize: {e}")))?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| candle_mi::MIError::Config(format!("create {}: {e}", parent.display())))?;
+    }
+    fs::write(path, &json).map_err(|e| candle_mi::MIError::Config(format!("write output: {e}")))?;
+    eprintln!("Output written to {}", path.display());
+    Ok(())
+}
