@@ -1,0 +1,45 @@
+Registered tests: H1 = CI separation of pooled inject fractions; H2 = Fisher on pooled natural rate at alpha = 0.05/12 = 0.0042
+
+== gemma2-2b-2.5m: 12 runs, 4 prompts, N = 720 lines per condition
+  baseline         inject    0/720 [0.000,0.005]  natural  220/720 [0.272,0.341]
+  suppress-only    inject    0/720 [0.000,0.005]  natural  239/720 [0.298,0.368]  H1 fail  natural-rate Fisher p=3.09e-01  sign consistent across prompts: True
+  inject-only      inject    0/720 [0.000,0.005]  natural  219/720 [0.271,0.339]  H1 fail  natural-rate Fisher p=1.00e+00  sign consistent across prompts: False
+  suppress+inject  inject    0/720 [0.000,0.005]  natural  244/720 [0.304,0.375]  H1 fail  natural-rate Fisher p=1.95e-01  sign consistent across prompts: True
+  minimum detectable inject fraction against this baseline: 0.013
+  per prompt (inject / natural counts per condition):
+    about    baseline: 0/66/180  suppress-only: 0/70/180  inject-only: 0/74/180  suppress+inject: 0/76/180
+    shout    baseline: 0/62/180  suppress-only: 0/68/180  inject-only: 0/57/180  suppress+inject: 0/66/180
+    so       baseline: 0/61/180  suppress-only: 0/64/180  inject-only: 0/60/180  suppress+inject: 0/62/180
+    who      baseline: 0/31/180  suppress-only: 0/37/180  inject-only: 0/28/180  suppress+inject: 0/40/180
+
+== gemma2-2b-426k: 12 runs, 4 prompts, N = 720 lines per condition
+  baseline         inject   21/720 [0.018,0.044]  natural  220/720 [0.272,0.341]
+  suppress-only    inject   17/720 [0.014,0.038]  natural  217/720 [0.268,0.336]  H1 fail  natural-rate Fisher p=9.09e-01  sign consistent across prompts: False
+  inject-only      inject   31/720 [0.029,0.061]  natural  164/720 [0.198,0.260]  H1 fail  natural-rate Fisher p=1.03e-03 (< alpha) sign consistent across prompts: False
+  suppress+inject  inject   38/720 [0.038,0.072]  natural  188/720 [0.229,0.295]  H1 fail  natural-rate Fisher p=6.98e-02  sign consistent across prompts: False
+  minimum detectable inject fraction against this baseline: 0.061
+  per prompt (inject / natural counts per condition):
+    about    baseline: 12/66/180  suppress-only: 10/61/180  inject-only: 8/51/180  suppress+inject: 12/55/180
+    shout    baseline: 7/62/180  suppress-only: 7/60/180  inject-only: 8/70/180  suppress+inject: 3/76/180
+    so       baseline: 1/61/180  suppress-only: 0/50/180  inject-only: 14/26/180  suppress+inject: 19/32/180
+    who      baseline: 1/31/180  suppress-only: 0/46/180  inject-only: 1/17/180  suppress+inject: 4/25/180
+
+== llama3.2-1b-524k: 9 runs, 3 prompts, N = 540 lines per condition
+  baseline         inject    0/540 [0.000,0.007]  natural   61/540 [0.088,0.143]
+  suppress-only    inject    0/540 [0.000,0.007]  natural   41/540 [0.055,0.102]  H1 fail  natural-rate Fisher p=4.76e-02  sign consistent across prompts: True
+  inject-only      inject    1/540 [0.000,0.010]  natural   71/540 [0.104,0.163]  H1 fail  natural-rate Fisher p=4.03e-01  sign consistent across prompts: True
+  suppress+inject  inject    4/540 [0.002,0.019]  natural   70/540 [0.102,0.161]  H1 fail  natural-rate Fisher p=4.56e-01  sign consistent across prompts: False
+  minimum detectable inject fraction against this baseline: 0.017
+  per prompt (inject / natural counts per condition):
+    free     baseline: 0/41/180  suppress-only: 0/26/180  inject-only: 0/48/180  suppress+inject: 0/54/180
+    more     baseline: 0/13/180  suppress-only: 0/10/180  inject-only: 1/14/180  suppress+inject: 4/8/180
+    new      baseline: 0/7/180  suppress-only: 0/5/180  inject-only: 0/9/180  suppress+inject: 0/8/180
+
+== qwen3-0.6b-16k-ation: 3 runs, 1 prompts, N = 180 lines per condition
+  baseline         inject    0/180 [0.000,0.020]  natural    7/180 [0.016,0.078]
+  suppress-only    inject    0/180 [0.000,0.020]  natural    1/180 [0.000,0.031]  H1 fail  natural-rate Fisher p=6.73e-02  sign consistent across prompts: True
+  inject-only      inject    1/180 [0.000,0.031]  natural   11/180 [0.031,0.107]  H1 fail  natural-rate Fisher p=4.69e-01  sign consistent across prompts: True
+  suppress+inject  inject    2/180 [0.001,0.040]  natural    3/180 [0.003,0.048]  H1 fail  natural-rate Fisher p=3.37e-01  sign consistent across prompts: True
+  minimum detectable inject fraction against this baseline: 0.050
+  per prompt (inject / natural counts per condition):
+    ation    baseline: 0/7/180  suppress-only: 0/1/180  inject-only: 1/11/180  suppress+inject: 2/3/180

@@ -1,0 +1,93 @@
+self-check: 36 files, all conditions match the stored m1 counts
+
+== gemma2-2b-2.5m   (n = 720 sampled lines per condition)
+  1. insertion of the injected word into the composed line
+     condition          contains  as 1st word  middle  final only
+     baseline              9/720             0       9           0
+     suppress-only        10/720             0      10           0
+     inject-only         358/720           355       3           0
+     suppress+inject     370/720           366       4           0
+  2. inject-group endings under criteria of increasing strictness (Fisher vs baseline)
+     criterion                                       base   sup   inj   s+i   p (base vs s+i)
+     raw                                                0     0     0     0          1.00e+00   s+i 95% CI [0.000,0.005]
+     not-final-word                                     0     0     0     0          1.00e+00   s+i 95% CI [0.000,0.005]
+     not-before-final                                   0     0     0     0          1.00e+00   s+i 95% CI [0.000,0.005]
+     not-before-final + no 3x repeat + 4 distinct       0     0     0     0          1.00e+00   s+i 95% CI [0.000,0.005]
+     not-before-final + no repeat + 5 distinct          0     0     0     0          1.00e+00   s+i 95% CI [0.000,0.005]
+     absent                                             0     0     0     0          1.00e+00   s+i 95% CI [0.000,0.005]
+  3. composition quality
+     condition         mean words  type/token    word x3+
+     baseline                 7.4       0.940    19/720  
+     suppress-only            7.5       0.948    19/720  
+     inject-only              7.7       0.948    12/720  
+     suppress+inject          7.7       0.950     5/720  
+     repetition baseline vs suppress+inject: p = 6.18e-03
+
+== gemma2-2b-426k   (n = 720 sampled lines per condition)
+  1. insertion of the injected word into the composed line
+     condition          contains  as 1st word  middle  final only
+     baseline              5/720             0       2           3
+     suppress-only         5/720             0       1           4
+     inject-only         639/720           638       0           1
+     suppress+inject     703/720           703       0           0
+  2. inject-group endings under criteria of increasing strictness (Fisher vs baseline)
+     criterion                                       base   sup   inj   s+i   p (base vs s+i)
+     raw                                               21    17    31    38          3.26e-02   s+i 95% CI [0.038,0.072]
+     not-final-word                                    17    13    14    23          4.23e-01   s+i 95% CI [0.020,0.048]
+     not-before-final                                  20    17     4     4          1.42e-03   s+i 95% CI [0.002,0.014]
+     not-before-final + no 3x repeat + 4 distinct      20    17     0     0          1.67e-06   s+i 95% CI [0.000,0.005]
+     not-before-final + no repeat + 5 distinct         15    14     0     0          5.67e-05   s+i 95% CI [0.000,0.005]
+     absent                                            17    13     0     0          1.39e-05   s+i 95% CI [0.000,0.005]
+  3. composition quality
+     condition         mean words  type/token    word x3+
+     baseline                 7.4       0.940    19/720  
+     suppress-only            7.4       0.938    28/720  
+     inject-only              5.9       0.936    25/718  
+     suppress+inject          6.1       0.934    25/719  
+     repetition baseline vs suppress+inject: p = 3.64e-01
+
+== llama3.2-1b-524k   (n = 540 sampled lines per condition)
+  1. insertion of the injected word into the composed line
+     condition          contains  as 1st word  middle  final only
+     baseline             19/540             1      18           0
+     suppress-only        16/540             3      13           0
+     inject-only         479/540           478       1           0
+     suppress+inject     471/540           470       1           0
+  2. inject-group endings under criteria of increasing strictness (Fisher vs baseline)
+     criterion                                       base   sup   inj   s+i   p (base vs s+i)
+     raw                                                0     0     1     4          1.24e-01   s+i 95% CI [0.002,0.019]
+     not-final-word                                     0     0     0     1          1.00e+00   s+i 95% CI [0.000,0.010]
+     not-before-final                                   0     0     0     2          5.00e-01   s+i 95% CI [0.000,0.013]
+     not-before-final + no 3x repeat + 4 distinct       0     0     0     0          1.00e+00   s+i 95% CI [0.000,0.007]
+     not-before-final + no repeat + 5 distinct          0     0     0     0          1.00e+00   s+i 95% CI [0.000,0.007]
+     absent                                             0     0     0     0          1.00e+00   s+i 95% CI [0.000,0.007]
+  3. composition quality
+     condition         mean words  type/token    word x3+
+     baseline                 7.2       0.955     2/540  
+     suppress-only            6.6       0.977     4/539  
+     inject-only              7.0       0.974     1/540  
+     suppress+inject          6.6       0.975     1/540  
+     repetition baseline vs suppress+inject: p = 1.00e+00
+
+== qwen3-0.6b-16k-ation   (n = 180 sampled lines per condition)
+  1. insertion of the injected word into the composed line
+     condition          contains  as 1st word  middle  final only
+     baseline              0/180             0       0           0
+     suppress-only         0/180             0       0           0
+     inject-only           3/180             0       2           1
+     suppress+inject       1/180             1       0           0
+  2. inject-group endings under criteria of increasing strictness (Fisher vs baseline)
+     criterion                                       base   sup   inj   s+i   p (base vs s+i)
+     raw                                                0     0     1     2          4.99e-01   s+i 95% CI [0.001,0.040]
+     not-final-word                                     0     0     0     1          1.00e+00   s+i 95% CI [0.000,0.031]
+     not-before-final                                   0     0     1     2          4.99e-01   s+i 95% CI [0.001,0.040]
+     not-before-final + no 3x repeat + 4 distinct       0     0     0     1          1.00e+00   s+i 95% CI [0.000,0.031]
+     not-before-final + no repeat + 5 distinct          0     0     0     1          1.00e+00   s+i 95% CI [0.000,0.031]
+     absent                                             0     0     0     1          1.00e+00   s+i 95% CI [0.000,0.031]
+  3. composition quality
+     condition         mean words  type/token    word x3+
+     baseline                 6.0       0.977     1/180  
+     suppress-only            3.5       0.981     2/159  
+     inject-only              7.0       0.973     2/180  
+     suppress+inject          6.1       0.985     1/178  
+     repetition baseline vs suppress+inject: p = 1.00e+00
