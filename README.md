@@ -24,6 +24,7 @@ probe recovers a newline-resident plan.
 | `candle-mi/` | Source snapshot of the [candle-mi](https://github.com/mi-for-the-rust-of-us/candle-mi) mechanistic-interpretability library, with the experiment programs under `examples/` |
 | `scripts/` | Python analysis layer (no GPU required) |
 | `data/` | Every committed artifact behind every number in the paper, one directory per experiment |
+| `docs/` | The registered specs for the two reruns, written before those runs, plus the paper directory's conventions |
 | `figures/` | The exported figure PDFs and the Wolfram script that produces them |
 
 A full clone is about 200 MB, most of it the dense JumpReLU feature censuses
@@ -38,6 +39,7 @@ under `data/figure13-newline/`.
 | Table 6 (composition horizon) | `data/horizon-power/fullline_*.json` |
 | Table 7 (redirect recount) | same files, via `scripts/horizon_leakage.py` |
 | Table 8 (pair-level re-analysis) | `data/pairs/suppress_inject_sweep_*.json` |
+| §4.6 newline activation patching | `data/patching/patch_*.json`, `samerime_*`, `midline_*` |
 | Figures 1--3 | `figures/fig_*.pdf` |
 | §4.1 localization null and prompt breadth | `data/figure13-controls/breadth_*.json` (+ raw sweeps in `_runs/`) |
 | §4.2 random controls, per position | `data/figure13-controls/random_*.json` |
@@ -76,6 +78,10 @@ python scripts/horizon_stats.py --pool data/horizon-power/fullline_*.json
 
 # Table 7: insertion counts and the six-criterion redirect recount
 python scripts/horizon_leakage.py data/horizon-power/fullline_*.json
+
+# §4.6: newline activation patching, registered criteria H1/H2 and the controls
+python scripts/patch_stats.py data/patching/patch_*.json
+python scripts/patch_stats.py data/patching/samerime_*.json data/patching/midline_*.json
 
 # Figure 2's claim: 36 position sweeps, peak inside the composed line 36/36
 python scripts/horizon_sweeps.py data/horizon-power/fullline_*.json
@@ -123,7 +129,10 @@ The same example carries the control flags (`--no-suppress`, `--random-inject`,
 `--random-direction`, `--random-init`, `--shuffle-weights`); the newline census
 and composition-horizon experiments are `figure13_newline_census` and
 `figure13_newline_steering`; the non-CLT baseline is `maar_contrastive_steering`
-and the transcoder comparison `clt_vs_plt_planning_site`.
+and the transcoder comparison `clt_vs_plt_planning_site`. The CLT-free newline
+patching experiment of §4.6 is `figure13_newline_patch`, driven by
+`candle-mi/scripts/run_patching.sh` (phases `validate`, `grid`, `controls`);
+its registered criteria are in `docs/patching-spec.md`.
 
 The composition-horizon experiment of §4.4 is driven by
 `candle-mi/scripts/run_horizon_power.sh` in the upstream library repository: 36

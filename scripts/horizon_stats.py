@@ -21,17 +21,44 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import math
 from math import comb
 from pathlib import Path
 
 
 def binom_cdf(k: int, n: int, p: float) -> float:
-  """P(X <= k) for X ~ Binomial(n, p).
+  """P(X <= k) for X ~ Binomial(n, p), computed in log space.
+
+  The direct form, ``sum(comb(n, i) * p**i * ...)``, overflows once ``comb(n, i)``
+  exceeds a float: at n = 1260 it raises `OverflowError` rather than returning a
+  wrong number, which is how this was caught. Terms are therefore accumulated
+  through `math.lgamma`.
 
   >>> round(binom_cdf(0, 20, 0.14), 3)
   0.049
+  >>> round(binom_cdf(384, 1260, 0.3), 6)   # the n that overflowed the old form
+  0.656531
+  >>> binom_cdf(5, 5, 0.5) == 1.0
+  True
   """
-  return sum(comb(n, i) * p**i * (1 - p) ** (n - i) for i in range(k + 1))
+  if k >= n:
+    return 1.0
+  if k < 0:
+    return 0.0
+  if p <= 0.0:
+    return 1.0
+  if p >= 1.0:
+    return 0.0
+  log_p, log_q = math.log(p), math.log1p(-p)
+  ln_fact_n = math.lgamma(n + 1)
+  total = 0.0
+  for i in range(k + 1):
+    log_term = (
+        ln_fact_n - math.lgamma(i + 1) - math.lgamma(n - i + 1)
+        + i * log_p + (n - i) * log_q
+    )
+    total += math.exp(log_term)
+  return min(total, 1.0)
 
 
 def _bisect(f, lo: float, hi: float) -> float:
